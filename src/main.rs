@@ -542,7 +542,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(custom_remotes) = &settings.git.custom_remotes {
         for remote in custom_remotes {
-            info!("Ensuring custom remote {} -> {}", remote.name, remote.url);
+            info!(
+                "Ensuring custom remote {} -> {}",
+                remote.name,
+                sashiko::utils::redact_secret(&remote.url)
+            );
             if let Err(e) =
                 sashiko::git_ops::ensure_remote(&repo_path, &remote.name, &remote.url, false).await
             {
