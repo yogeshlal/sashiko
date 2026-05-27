@@ -104,6 +104,12 @@ spec:
               value: "false"
             - name: SASHIKO__REVIEW__EMAIL_POLICY_PATH
               value: "/app/email_policy.toml"
+            - name: GIT_CONFIG_COUNT
+              value: "1"
+            - name: GIT_CONFIG_KEY_0
+              value: "grep.threads"
+            - name: GIT_CONFIG_VALUE_0
+              value: "4"
             - name: LLM_API_KEY
               valueFrom:
                 secretKeyRef:
