@@ -1,6 +1,6 @@
 #![allow(clippy::type_complexity)]
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -61,10 +61,7 @@ pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
     files
 }
 
-use grep_regex::RegexMatcher;
-use grep_searcher::{BinaryDetection, SearcherBuilder};
-use ignore::WalkBuilder;
-use std::sync::{Arc, Mutex};
+use tokio::process::Command;
 
 const MAX_PREFETCH_CHARS: usize = 200000;
 
@@ -125,109 +122,83 @@ pub async fn prefetch_context(worktree_path: &Path, diff: &str) -> Result<String
 
     let symbols: Vec<String> = symbols_to_lookup.into_iter().take(50).collect();
 
-    // Phase 2: look up referenced symbol definitions via ripgrep + tree-sitter.
+    // Phase 2: look up referenced symbol definitions via git grep + tree-sitter.
     if !symbols.is_empty() {
         let regex_pattern = format!(
             "^((struct|enum|union)\\s+({0})\\b|#define\\s+({0})\\b|([a-zA-Z_][a-zA-Z0-9_ \\t*]+\\s+)?({0})\\s*\\()",
             symbols.join("|")
         );
 
-        let matcher = match RegexMatcher::new(&regex_pattern) {
-            Ok(m) => m,
-            Err(_) => return render_range_map(&range_map, worktree_path, &file_ranges).await,
-        };
-
-        let search_path = worktree_path.to_path_buf();
         let caller_dirs: HashSet<&str> = file_ranges
             .keys()
             .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
             .collect();
-        // Two buckets per symbol: (general, priority). Priority = include/ or
-        // caller directories. Separate caps prevent the parallel walker from
-        // filling up with random .c files before it reaches include/ headers.
-        let candidates: Arc<Mutex<HashMap<String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>)>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-        let candidates_clone = Arc::clone(&candidates);
 
-        let caller_dirs_arc: Arc<Vec<String>> =
-            Arc::new(caller_dirs.iter().map(|s| s.to_string()).collect());
-        let _ = tokio::task::spawn_blocking(move || {
-            let walker = WalkBuilder::new(&search_path)
-                .hidden(false)
-                .ignore(true)
-                .git_ignore(true)
-                .build_parallel();
+        let mut cmd = Command::new("git");
+        cmd.current_dir(worktree_path)
+            .arg("grep")
+            .arg("-n")
+            .arg("-I")
+            .arg("-P")
+            .arg("-e")
+            .arg(&regex_pattern)
+            .arg("--")
+            .arg("*.c")
+            .arg("*.h");
 
-            walker.run(|| {
-                let matcher = matcher.clone();
-                let candidates = Arc::clone(&candidates_clone);
-                let symbols = symbols.clone();
-                let caller_dirs_for_walk = Arc::clone(&caller_dirs_arc);
-                let search_path = search_path.clone();
-                Box::new(move |result| {
-                    if let Ok(entry) = result {
-                        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                            return ignore::WalkState::Continue;
-                        }
-
-                        let path = entry.path().to_path_buf();
-                        let path_str = path.to_string_lossy();
-                        if !path_str.ends_with(".h") && !path_str.ends_with(".c") {
-                            return ignore::WalkState::Continue;
-                        }
-                        if is_noisy_tree(&path_str) {
-                            return ignore::WalkState::Continue;
-                        }
-
-                        let mut searcher = SearcherBuilder::new()
-                            .binary_detection(BinaryDetection::quit(b'\x00'))
-                            .line_number(true)
-                            .build();
-
-                        let rel = path
-                            .strip_prefix(&search_path)
-                            .map(|p| p.to_string_lossy())
-                            .unwrap_or_default();
-                        let is_priority = rel.starts_with("include/")
-                            || caller_dirs_for_walk.iter().any(|d| {
-                                rel.starts_with(d.as_str())
-                                    && rel.as_bytes().get(d.len()) == Some(&b'/')
-                            });
-                        let _ = searcher.search_path(
-                            &matcher,
-                            &path,
-                            grep_searcher::sinks::UTF8(|line_num, line| {
-                                for sym in &symbols {
-                                    if line_matches_symbol(line, sym) {
-                                        let mut defs = candidates.lock().unwrap();
-                                        let (general, priority) = defs
-                                            .entry(sym.clone())
-                                            .or_insert_with(|| (Vec::new(), Vec::new()));
-                                        if is_priority {
-                                            if priority.len() < 32 {
-                                                priority.push((path.clone(), line_num));
-                                            }
-                                        } else if general.len() < 32 {
-                                            general.push((path.clone(), line_num));
-                                        }
-                                    }
-                                }
-                                Ok(true)
-                            }),
-                        );
-                    }
-                    ignore::WalkState::Continue
-                })
-            });
-        })
-        .await;
-
-        let candidates_vec: Vec<(String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>))> = {
-            let mut defs = candidates.lock().unwrap();
-            defs.drain().collect()
+        let output = match cmd.output().await {
+            Ok(o) => o,
+            Err(e) => return Err(anyhow!("Failed to run git grep: {}", e)),
         };
 
-        for (sym, (general, priority)) in candidates_vec {
+        if !output.status.success() {
+            // git grep returns exit status 1 if no matches are found, which is not a hard error.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                return Err(anyhow!("git grep failed: {}", stderr));
+            }
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut candidates: HashMap<String, (Vec<(PathBuf, u64)>, Vec<(PathBuf, u64)>)> =
+            HashMap::new();
+
+        for line in stdout.lines() {
+            if let Some((path_str, rest)) = line.split_once(':')
+                && let Some((line_num_str, line_content)) = rest.split_once(':')
+                && let Ok(line_num) = line_num_str.parse::<u64>()
+            {
+                let abs_path = worktree_path.join(path_str);
+                let abs_path_str = abs_path.to_string_lossy();
+                if is_noisy_tree(&abs_path_str) {
+                    continue;
+                }
+
+                let rel = path_str;
+                let is_priority = rel.starts_with("include/")
+                    || caller_dirs
+                        .iter()
+                        .any(|d| rel.starts_with(d) && rel.as_bytes().get(d.len()) == Some(&b'/'));
+
+                for sym in &symbols {
+                    if line_matches_symbol(line_content, sym) {
+                        let (general, priority) = candidates
+                            .entry(sym.clone())
+                            .or_insert_with(|| (Vec::new(), Vec::new()));
+
+                        if is_priority {
+                            if priority.len() < 32 {
+                                priority.push((abs_path.clone(), line_num));
+                            }
+                        } else if general.len() < 32 {
+                            general.push((abs_path.clone(), line_num));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (sym, (general, priority)) in candidates {
             let mut hits = priority;
             hits.extend(general);
             if let Some((path, start, end)) =

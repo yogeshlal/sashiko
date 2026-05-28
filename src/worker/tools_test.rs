@@ -33,7 +33,7 @@ mod tests {
         let toolbox = ToolBox::new(linux_path, None);
         let rt = Runtime::new().unwrap();
 
-        let args = json!({ "path": "." });
+        let args = json!({ "revision": "HEAD", "path": "." });
         let result = rt.block_on(toolbox.call("list_dir", args)).unwrap();
         let entries = result["entries"].as_array().unwrap();
 
@@ -48,6 +48,7 @@ mod tests {
         let rt = Runtime::new().unwrap();
 
         let args = json!({
+            "revision": "HEAD",
             "files": [
                 { "path": "README.md", "start_line": 1, "end_line": 5 }
             ]
@@ -68,7 +69,7 @@ mod tests {
         let toolbox = ToolBox::new(linux_path, None);
         let rt = Runtime::new().unwrap();
 
-        let args = json!({ "args": ["-n", "1"] });
+        let args = json!({ "range": "HEAD", "limit": 1 });
         let result = rt.block_on(toolbox.call("git_log", args)).unwrap();
         let output = result["output"].as_str().unwrap();
 
@@ -96,7 +97,8 @@ mod tests {
         let toolbox = ToolBox::new(linux_path, None);
         let rt = Runtime::new().unwrap();
 
-        let args = json!({ "path": "README.md", "start_line": 1, "end_line": 3 });
+        let args =
+            json!({ "revision": "HEAD", "path": "README.md", "start_line": 1, "end_line": 3 });
         let result = rt.block_on(toolbox.call("git_blame", args)).unwrap();
         let content = result["content"].as_str().unwrap();
 
@@ -113,6 +115,7 @@ mod tests {
 
         // Search for "Sashiko" which should be in README.md
         let args = json!({
+            "revision": "HEAD",
             "pattern": "Sashiko",
             "path": "README.md"
         });

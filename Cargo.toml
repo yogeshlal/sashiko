@@ -44,11 +44,6 @@ google-cloud-auth = { version = "1.10", optional = true }
 fastrand = "2.3.0"
 flate2 = "1.1.9"
 futures = "0.3.31"
-grep = "0.4.1"
-grep-matcher = "0.1.8"
-grep-regex = "0.1.14"
-grep-searcher = "0.1.16"
-ignore = "0.4.25"
 lettre = { version = "0.11.7", default-features = false, features = ["builder", "hostname", "pool", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 libsql = "0.9.29"
 mail-parser = "0.11.1"

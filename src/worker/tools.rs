@@ -15,37 +15,11 @@
 use crate::ai::AiTool;
 use crate::ai::truncator::Truncator;
 use anyhow::{Result, anyhow, ensure};
-use grep::printer::StandardBuilder;
-use grep::regex::RegexMatcher;
-use grep::searcher::{BinaryDetection, SearcherBuilder};
-use ignore::WalkBuilder;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-
-fn validate_git_args(
-    args: &[&str],
-    allowed_exact: &[&str],
-    allowed_prefixes: &[&str],
-) -> Result<()> {
-    for arg in args {
-        if *arg == "--" {
-            break;
-        }
-        if arg.starts_with('-') {
-            let is_allowed = allowed_exact.contains(arg)
-                || allowed_prefixes.iter().any(|p| arg.starts_with(p))
-                || (arg.starts_with("-U") && arg[2..].chars().all(|c| c.is_ascii_digit()))
-                || (arg.starts_with("-n") && arg[2..].chars().all(|c| c.is_ascii_digit()));
-
-            if !is_allowed {
-                return Err(anyhow!("Forbidden git option: {}", arg));
-            }
-        }
-    }
-    Ok(())
-}
 
 pub struct ToolBox {
     worktree_path: PathBuf,
@@ -69,11 +43,12 @@ impl ToolBox {
         let mut decls = vec![
             AiTool {
                 name: "read_files".to_string(),
-                description: "Read the content of one or more files. In 'smart' mode, it collapses irrelevant code around the focus lines."
+                description: "Read the content of one or more files at a specific Git revision. In 'smart' mode, it collapses irrelevant code around the focus lines."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
+                        "revision": { "type": "string", "description": "The Git commit SHA or reference (e.g., HEAD, baseline SHA, or target commit SHA) to read from." },
                         "files": {
                             "type": "array",
                             "description": "List of files to read.",
@@ -89,7 +64,7 @@ impl ToolBox {
                         },
                         "mode": { "type": "string", "enum": ["raw", "smart"], "description": "Read mode. Defaults to 'raw'." }
                     },
-                    "required": ["files"]
+                    "required": ["revision", "files"]
                 }),
             },
             AiTool {
@@ -99,23 +74,25 @@ impl ToolBox {
                 parameters: json!({
                     "type": "object",
                     "properties": {
+                        "revision": { "type": "string", "description": "The Git commit SHA or reference to blame from." },
                         "path": { "type": "string", "description": "Relative path to the file." },
                         "start_line": { "type": "integer", "description": "1-based start line (optional)." },
                         "end_line": { "type": "integer", "description": "1-based end line (optional)." }
                     },
-                    "required": ["path"]
+                    "required": ["revision", "path"]
                 }),
             },
             AiTool {
                 name: "git_diff".to_string(),
-                description: "Show changes between commits, commit and working tree, etc."
+                description: "Show changes between two commits or revisions."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for git diff (e.g., ['HEAD^', 'HEAD'])." }
+                        "base_revision": { "type": "string", "description": "The baseline commit SHA or revision reference." },
+                        "target_revision": { "type": "string", "description": "The target commit SHA or revision reference to compare against." }
                     },
-                    "required": ["args"]
+                    "required": ["base_revision", "target_revision"]
                 }),
             },
             AiTool {
@@ -135,85 +112,55 @@ impl ToolBox {
             },
             AiTool {
                 name: "git_log".to_string(),
-                description: "Show commit logs. IMPORTANT: When using expensive search flags like -S or -G, you MUST limit the search range using --since (e.g., '--since=1.year.ago') or specific commit ranges to avoid timeouts on large repositories.".to_string(),
+                description: "Show commit logs in a specific range or revision history.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for git log (e.g., ['-n', '3', '--oneline']). Bounded to 100 commits by default unless overridden. For -S/-G searches, always include a time limit like '--since=1.year.ago'." }
+                        "range": { "type": "string", "description": "The commit range or reference to view logs for (e.g., 'baseline..HEAD' or 'HEAD')." },
+                        "limit": { "type": "integer", "description": "Limit the number of commits returned (defaults to 10, max 100)." }
                     },
-                }),
-            },
-            AiTool {
-                name: "git_status".to_string(),
-                description: "Show the working tree status.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {},
-                }),
-            },
-            AiTool {
-                name: "git_checkout".to_string(),
-                description: "Switch branches or restore working tree files.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "target": { "type": "string", "description": "The branch or commit to checkout." }
-                    },
-                    "required": ["target"]
-                }),
-            },
-            AiTool {
-                name: "git_branch".to_string(),
-                description: "List both remote-tracking branches and local branches.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {},
-                }),
-            },
-            AiTool {
-                name: "git_tag".to_string(),
-                description: "List tags.".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {},
+                    "required": ["range"]
                 }),
             },
             AiTool {
                 name: "list_dir".to_string(),
-                description: "List files in a directory.".to_string(),
+                description: "List files in a directory at a specific Git revision.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory path." }
+                        "revision": { "type": "string", "description": "The Git commit SHA or reference to list from." },
+                        "path": { "type": "string", "description": "Relative path to the directory (e.g., '.' or 'src/')." }
                     },
-                    "required": ["path"]
+                    "required": ["revision", "path"]
                 }),
             },
             AiTool {
                 name: "search_file_content".to_string(),
-                description: "Search for a pattern in files using grep. Returns matching lines with context.".to_string(),
+                description: "Search for a pattern in files using git grep at a specific Git revision. Returns matching lines with context.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
+                        "revision": { "type": "string", "description": "The Git commit SHA or reference to search at." },
                         "pattern": { "type": "string", "description": "Regex pattern to search for." },
-                        "path": { "type": "string", "description": "Directory to search in (defaults to root)." },
+                        "path": { "type": "string", "description": "Relative path directory or file to limit the search (optional)." },
                         "context_lines": { "type": "integer", "description": "Number of context lines to show (default 0)." }
                     },
-                    "required": ["pattern"]
+                    "required": ["revision", "pattern"]
                 }),
             },
             AiTool {
                 name: "find_files".to_string(),
-                description: "Find files matching a glob pattern (e.g., '*.rs', 'src/**/mod.rs').".to_string(),
+                description: "Find files matching a glob pattern in a specific Git revision.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Glob pattern to match." },
-                        "path": { "type": "string", "description": "Directory to search in (defaults to root)." }
+                        "revision": { "type": "string", "description": "The Git commit SHA or reference to search in." },
+                        "pattern": { "type": "string", "description": "Glob pattern to match (e.g., '*.rs' or 'src/**/mod.rs')." }
                     },
-                    "required": ["pattern"]
+                    "required": ["revision", "pattern"]
                 }),
             },
+
         ];
 
         if self.prompts_path.is_some() {
@@ -241,13 +188,10 @@ impl ToolBox {
             "git_diff" => self.git_diff(args).await,
             "git_show" => self.git_show(args).await,
             "git_log" => self.git_log(args).await,
-            "git_status" => self.git_status(args).await,
-            "git_checkout" => self.git_checkout(args).await,
-            "git_branch" => self.git_branch(args).await,
-            "git_tag" => self.git_tag(args).await,
             "list_dir" => self.list_dir(args).await,
             "search_file_content" => self.search_file_content(args).await,
             "find_files" => self.find_files(args).await,
+
             "read_prompt" => self.read_prompt(args).await,
             _ => Err(anyhow!("Unknown tool: {}", name)),
         }
@@ -273,6 +217,9 @@ impl ToolBox {
     }
 
     async fn read_files(&self, args: Value) -> Result<Value> {
+        let revision = args["revision"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing revision"))?;
         let files = args["files"]
             .as_array()
             .ok_or_else(|| anyhow!("Missing files"))?;
@@ -291,7 +238,7 @@ impl ToolBox {
             let end_line = file_args["end_line"].as_u64().map(|v| v as usize);
 
             match self
-                .read_single_file(path_str, start_line, end_line, mode)
+                .read_single_file(revision, path_str, start_line, end_line, mode)
                 .await
             {
                 Ok(mut val) => {
@@ -314,13 +261,31 @@ impl ToolBox {
 
     async fn read_single_file(
         &self,
+        revision: &str,
         path_str: &str,
         start_line: Option<usize>,
         end_line: Option<usize>,
         mode: &str,
     ) -> Result<Value> {
-        let path = self.validate_path(path_str, &self.worktree_path)?;
-        let content = fs::read_to_string(path).await?;
+        if path_str.starts_with('-') {
+            return Err(anyhow!("Invalid path name: {}", path_str));
+        }
+
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.worktree_path)
+            .args(["show", &format!("{}:{}", revision, path_str)]);
+
+        let output = cmd.output().await?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git show failed to read file {} at {}: {}",
+                path_str,
+                revision,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        let content = String::from_utf8_lossy(&output.stdout).to_string();
 
         if let (Some(s), Some(e)) = (start_line, end_line) {
             ensure!(s <= e, "Invalid range: start_line ({s}) > end_line ({e})");
@@ -330,7 +295,6 @@ impl ToolBox {
         let total_lines = lines.len();
 
         let start_line = start_line.map(|s| s.clamp(1, total_lines));
-        // No need to clamp start against end — the earlier validation already guarantees start <= end
         let end_line = end_line.map(|e| e.clamp(1, total_lines));
 
         if mode == "smart" {
@@ -378,6 +342,9 @@ impl ToolBox {
     }
 
     async fn git_blame(&self, args: Value) -> Result<Value> {
+        let revision = args["revision"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing revision"))?;
         let path_str = args["path"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
@@ -391,7 +358,7 @@ impl ToolBox {
             cmd.arg(format!("-L{},{}", s, e));
         }
 
-        cmd.arg("--").arg(path_str);
+        cmd.arg(revision).arg("--").arg(path_str);
 
         let output = cmd.output().await?;
         if !output.status.success() {
@@ -406,32 +373,26 @@ impl ToolBox {
     }
 
     async fn git_diff(&self, args: Value) -> Result<Value> {
-        let diff_args = args["args"]
-            .as_array()
-            .ok_or_else(|| anyhow!("Missing args"))?;
-        let diff_args_str: Vec<&str> = diff_args.iter().filter_map(|v| v.as_str()).collect();
+        let base = args["base_revision"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing base_revision"))?;
+        let target = args["target_revision"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing target_revision"))?;
 
-        let allowed_exact = ["--stat", "--name-only", "--name-status", "-p", "-R", "--"];
-        let allowed_prefixes = ["--unified=", "--diff-algorithm="];
-        validate_git_args(&diff_args_str, &allowed_exact, &allowed_prefixes)?;
+        if base.starts_with('-') || target.starts_with('-') {
+            return Err(anyhow!("Invalid revision names"));
+        }
 
         let output = Command::new("git")
             .current_dir(&self.worktree_path)
-            .arg("diff")
-            .arg("--diff-algorithm=histogram")
-            .args(&diff_args_str)
+            .args(["diff", "--diff-algorithm=histogram", base, target])
             .output()
             .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let mut error_msg = format!("git diff failed: {}", stderr);
-
-            if stderr.contains("unknown revision") || stderr.contains("ambiguous argument") {
-                error_msg.push_str("\nHint: The repository might be a shallow clone (depth=1). You cannot access history beyond HEAD. Try using 'HEAD' or diffing against specific files without revision ranges.");
-            }
-
-            return Err(anyhow!(error_msg));
+            return Err(anyhow!("git diff failed: {}", stderr));
         }
 
         let content = String::from_utf8_lossy(&output.stdout).to_string();
@@ -439,65 +400,22 @@ impl ToolBox {
     }
 
     async fn git_log(&self, args: Value) -> Result<Value> {
-        let log_args_str: Vec<&str> = args["args"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
+        let range = args["range"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing range"))?;
+        let limit = args["limit"].as_u64().unwrap_or(10).min(100) as usize;
 
-        let allowed_exact = [
-            "--oneline",
-            "--graph",
-            "--decorate",
-            "--abbrev-commit",
-            "-p",
-            "--stat",
-            "--name-only",
-            "--name-status",
-            "--follow",
-            "--",
-            "--since",
-            "--until",
-            "--author",
-            "--grep",
-            "-S",
-            "-G",
-            "-n",
-            "--max-count",
-        ];
-        let allowed_prefixes = [
-            "--since=",
-            "--until=",
-            "--author=",
-            "--grep=",
-            "-S",
-            "-G",
-            "-n",
-            "--max-count=",
-            "--pretty=",
-            "--format=",
-        ];
-        validate_git_args(&log_args_str, &allowed_exact, &allowed_prefixes)?;
+        if range.starts_with('-') {
+            return Err(anyhow!("Invalid range"));
+        }
 
+        let limit_str = limit.to_string();
         let mut cmd = Command::new("git");
         cmd.current_dir(&self.worktree_path)
-            .arg("log")
-            .args(["-n", "100"])
-            .args(&log_args_str)
+            .args(["log", "-n", &limit_str, range])
             .kill_on_drop(true);
 
-        let output_result =
-            tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await;
-
-        let output = match output_result {
-            Ok(Ok(out)) => out,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                return Ok(
-                    json!({ "error": "git log command timed out after 120 seconds. Please avoid using extremely slow search flags like -S or -G on large repositories." }),
-                );
-            }
-        };
-
+        let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Ok(json!({ "error": format!("git log failed: {}", stderr) }));
@@ -570,45 +488,51 @@ impl ToolBox {
         Ok(json!({ "content": self.truncate_output(content) }))
     }
 
-    async fn git_status(&self, _args: Value) -> Result<Value> {
-        let content = crate::git_ops::git_status(&self.worktree_path).await?;
-        Ok(json!({ "content": content }))
-    }
-
-    async fn git_checkout(&self, args: Value) -> Result<Value> {
-        let target = args["target"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing target"))?;
-        crate::git_ops::git_checkout(&self.worktree_path, target).await?;
-        Ok(json!({ "status": "success", "message": format!("Checked out {}", target) }))
-    }
-
-    async fn git_branch(&self, _args: Value) -> Result<Value> {
-        let content = crate::git_ops::git_branch(&self.worktree_path).await?;
-        Ok(json!({ "content": content }))
-    }
-
-    async fn git_tag(&self, _args: Value) -> Result<Value> {
-        let content = crate::git_ops::git_tag(&self.worktree_path).await?;
-        Ok(json!({ "content": content }))
-    }
-
     async fn list_dir(&self, args: Value) -> Result<Value> {
+        let revision = args["revision"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing revision"))?;
         let path_str = args["path"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing path"))?;
-        let path = self.validate_path(path_str, &self.worktree_path)?;
 
+        if revision.starts_with('-') || path_str.starts_with('-') {
+            return Err(anyhow!("Invalid revision or path name"));
+        }
+
+        let tree_spec = if path_str.is_empty() || path_str == "." {
+            revision.to_string()
+        } else {
+            format!("{}:{}", revision, path_str)
+        };
+
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.worktree_path)
+            .args(["ls-tree", &tree_spec]);
+
+        let output = cmd.output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Ok(
+                json!({ "error": format!("git ls-tree failed for {}: {}", tree_spec, stderr) }),
+            );
+        }
+
+        let content = String::from_utf8_lossy(&output.stdout).to_string();
         let mut entries = Vec::new();
-        let mut read_dir = fs::read_dir(path).await?;
-
-        while let Some(entry) = read_dir.next_entry().await? {
-            let ty = if entry.file_type().await?.is_dir() {
-                "dir"
-            } else {
-                "file"
-            };
-            entries.push(json!({ "name": entry.file_name().to_string_lossy(), "type": ty }));
+        for line in content.lines() {
+            let split_tab: Vec<&str> = line.split('\t').collect();
+            if split_tab.len() >= 2 {
+                let filename = split_tab[1];
+                let metadata: Vec<&str> = split_tab[0].split_whitespace().collect();
+                if metadata.len() >= 2 {
+                    let ty = match metadata[1] {
+                        "tree" => "dir",
+                        _ => "file",
+                    };
+                    entries.push(json!({ "name": filename, "type": ty }));
+                }
+            }
         }
 
         if entries.len() > 1000 {
@@ -617,6 +541,98 @@ impl ToolBox {
 
         Ok(json!({ "entries": entries }))
     }
+
+    async fn search_file_content(&self, args: Value) -> Result<Value> {
+        let revision = args["revision"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing revision"))?;
+        let pattern = args["pattern"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing pattern"))?;
+        let path_str = args["path"].as_str();
+        let context_lines = args["context_lines"].as_u64().unwrap_or(0) as usize;
+
+        if revision.starts_with('-') || pattern.starts_with('-') {
+            return Err(anyhow!("Invalid revision or pattern"));
+        }
+
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.worktree_path)
+            .arg("grep")
+            .arg("-n")
+            .arg("-I")
+            .arg("-P")
+            .arg(format!("-C{}", context_lines))
+            .arg(pattern)
+            .arg(revision);
+
+        if let Some(p) = path_str
+            && p != "."
+            && !p.is_empty()
+        {
+            cmd.arg("--").arg(p);
+        }
+
+        let output = cmd.output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                return Ok(json!({ "matches": [], "message": "No matches found." }));
+            }
+            return Ok(json!({ "error": format!("git grep failed: {}", stderr) }));
+        }
+
+        let content = String::from_utf8_lossy(&output.stdout).to_string();
+        Ok(json!({ "content": self.truncate_output(content) }))
+    }
+
+    async fn find_files(&self, args: Value) -> Result<Value> {
+        let revision = args["revision"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing revision"))?;
+        let pattern = args["pattern"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing pattern"))?;
+
+        if revision.starts_with('-') {
+            return Err(anyhow!("Invalid revision"));
+        }
+
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.worktree_path)
+            .args(["ls-tree", "-r", "--name-only", revision]);
+
+        let output = cmd.output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Ok(json!({ "error": format!("git ls-tree failed: {}", stderr) }));
+        }
+
+        let content = String::from_utf8_lossy(&output.stdout).to_string();
+        let files: Vec<&str> = content.lines().collect();
+
+        let regex = glob_to_regex(pattern)?;
+        let mut matched_files = Vec::new();
+        for f in files {
+            if regex.is_match(f) {
+                matched_files.push(f);
+            }
+        }
+
+        if matched_files.len() > 1000 {
+            let truncated = matched_files[..1000].join("\n");
+            return Ok(json!({
+                 "files": truncated,
+                 "total_found": matched_files.len(),
+                 "message": "Output truncated to 1000 files."
+            }));
+        }
+
+        let content_matched = matched_files.join("\n");
+        Ok(json!({ "files": content_matched }))
+    }
+
+
 
     fn validate_path(&self, relative: &str, base: &Path) -> Result<PathBuf> {
         if relative.contains("..") || relative.starts_with("/") {
@@ -652,124 +668,25 @@ impl ToolBox {
 
         Ok(canonical_full)
     }
+}
 
-    async fn search_file_content(&self, args: Value) -> Result<Value> {
-        let pattern = args["pattern"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing pattern"))?
-            .to_string();
-        let path_str = args["path"].as_str().unwrap_or(".").to_string();
-        let context_lines = args["context_lines"].as_u64().unwrap_or(0) as usize;
-
-        let search_path = self.validate_path(&path_str, &self.worktree_path)?;
-        let worktree_root = self.worktree_path.clone();
-
-        // Perform blocking search operation in a separate thread
-        let content = tokio::task::spawn_blocking(move || {
-            let matcher =
-                RegexMatcher::new(&pattern).map_err(|e| anyhow!("Invalid regex: {}", e))?;
-            let mut searcher = SearcherBuilder::new()
-                .binary_detection(BinaryDetection::quit(b'\x00'))
-                .line_number(true)
-                .before_context(context_lines)
-                .after_context(context_lines)
-                .build();
-
-            // We use an Arc<Mutex<Vec<u8>>> to capture output because WalkBuilder is multithreaded (by default)
-            // or if we use synchronous, we can just use a simple Vec if we don't thread.
-            // But WalkBuilder::new() returns an iterator which is driven on the current thread.
-            // So we can just use a simple buffer.
-            let mut output_buffer = Vec::new();
-
-            // Standard printer writes to the buffer.
-            // Create a new printer for each file to write to the shared buffer.
-            // Actually, `printer` takes a `W`.
-
-            let walker = WalkBuilder::new(&search_path)
-                .hidden(false) // Search hidden files (default ignore handles .git).
-                .ignore(true) // Respect .ignore
-                .git_ignore(true) // Respect .gitignore
-                .build();
-
-            for result in walker {
-                match result {
-                    Ok(entry) => {
-                        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                            continue;
-                        }
-
-                        // We use a fresh buffer for this file to avoid borrowing issues if we reused one
-                        // strictly speaking, but StandardBuilder::build_no_color takes W.
-                        // We can just pass a mutable reference to our main buffer.
-                        let mut printer = StandardBuilder::new().build_no_color(&mut output_buffer);
-
-                        let path_to_print = entry
-                            .path()
-                            .strip_prefix(&worktree_root)
-                            .unwrap_or(entry.path());
-
-                        let _ = searcher.search_path(
-                            &matcher,
-                            entry.path(),
-                            printer.sink_with_path(&matcher, path_to_print),
-                        );
-                    }
-                    Err(_) => continue, // Ignore permission errors etc, similar to grep -r 2>/dev/null
-                }
+fn glob_to_regex(glob: &str) -> Result<regex::Regex> {
+    let mut regex_str = String::new();
+    regex_str.push('^');
+    for c in glob.chars() {
+        match c {
+            '*' => regex_str.push_str(".*"),
+            '?' => regex_str.push('.'),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '[' | ']' | '{' | '}' | '\\' => {
+                regex_str.push('\\');
+                regex_str.push(c);
             }
-
-            String::from_utf8(output_buffer)
-                .map_err(|e| anyhow!("Search output was not valid UTF-8: {}", e))
-        })
-        .await??;
-
-        if content.is_empty() {
-            return Ok(json!({ "matches": [], "message": "No matches found." }));
+            _ => regex_str.push(c),
         }
-
-        Ok(json!({ "content": self.truncate_output(content) }))
     }
-
-    async fn find_files(&self, args: Value) -> Result<Value> {
-        let pattern = args["pattern"]
-            .as_str()
-            .ok_or_else(|| anyhow!("Missing pattern"))?;
-        let path_str = args["path"].as_str().unwrap_or(".");
-
-        let path = self.validate_path(path_str, &self.worktree_path)?;
-
-        let output = Command::new("find")
-            .current_dir(&self.worktree_path)
-            .arg(path)
-            .arg("-name")
-            .arg(pattern)
-            .arg("-not")
-            .arg("-path")
-            .arg("*/.*")
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            return Err(anyhow!(
-                "find failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-
-        let content = String::from_utf8_lossy(&output.stdout).to_string();
-        let files: Vec<&str> = content.lines().collect();
-
-        if files.len() > 1000 {
-            let truncated = files[..1000].join("\n");
-            return Ok(json!({
-                 "files": truncated,
-                 "total_found": files.len(),
-                 "message": "Output truncated to 1000 files."
-            }));
-        }
-
-        Ok(json!({ "files": content }))
-    }
+    regex_str.push('$');
+    regex::Regex::new(&regex_str)
+        .map_err(|e| anyhow::anyhow!("Invalid glob converted to regex: {}", e))
 }
 
 #[cfg(test)]
@@ -782,17 +699,49 @@ mod tests {
     #[tokio::test]
     async fn test_search_file_content() -> Result<()> {
         let dir = tempdir()?;
-        let file_path = dir.path().join("test.rs");
+        let repo_path = dir.path().to_path_buf();
+
+        // Init git repo
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "user.name", "Test User"])
+            .output()
+            .await?;
+
+        let file_path = repo_path.join("test.rs");
         let mut file = File::create(&file_path)?;
         writeln!(file, "fn main() {{")?;
         writeln!(file, "    println!(\"Hello World\");")?;
         writeln!(file, "    // TODO: fix this")?;
         writeln!(file, "}}")?;
 
-        let toolbox = ToolBox::new(dir.path().to_path_buf(), None);
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["commit", "-m", "Initial"])
+            .output()
+            .await?;
+
+        let toolbox = ToolBox::new(repo_path.clone(), None);
 
         // Test basic search
         let args = json!({
+            "revision": "HEAD",
             "pattern": "println",
             "path": "."
         });
@@ -804,6 +753,7 @@ mod tests {
 
         // Test context
         let args = json!({
+            "revision": "HEAD",
             "pattern": "TODO",
             "context_lines": 1
         });
@@ -820,15 +770,16 @@ mod tests {
     #[tokio::test]
     async fn test_tool_normalization() -> Result<()> {
         let dir = tempdir()?;
-        let toolbox = ToolBox::new(dir.path().to_path_buf(), None);
+        let prompt_path = dir.path().join("test.md");
+        std::fs::write(&prompt_path, "prompt content")?;
 
-        // Test with whitespace and mixed case
+        let toolbox = ToolBox::new(dir.path().to_path_buf(), Some(dir.path().to_path_buf()));
+
         let args = json!({
-            "path": "."
+            "name": "test.md"
         });
-        let result = toolbox.call("  List_Dir  ", args).await?;
-
-        assert!(result["entries"].is_array());
+        let result = toolbox.call("  Read_Prompt  ", args).await?;
+        assert_eq!(result["content"].as_str().unwrap(), "prompt content");
 
         Ok(())
     }
@@ -880,43 +831,23 @@ mod tests {
             .output()
             .await?;
 
-        // Test git_status
-        let result = toolbox.call("git_status", json!({})).await?;
-        let content = result["content"].as_str().unwrap();
-        assert!(content.contains("nothing to commit"));
-
-        // Test git_branch
-        let result = toolbox.call("git_branch", json!({})).await?;
-        let content = result["content"].as_str().unwrap();
-        assert!(content.contains("master"));
-
-        // Create branch
-        Command::new("git")
-            .current_dir(&repo_path)
-            .args(["branch", "new-feature"])
-            .output()
+        // Test read_files
+        let result = toolbox
+            .call(
+                "read_files",
+                json!({
+                    "revision": "HEAD",
+                    "files": [{"path": "test.txt"}]
+                }),
+            )
             .await?;
+        let content = result["results"][0]["content"].as_str().unwrap();
+        assert!(content.contains("Hello"));
 
-        // Test git_checkout
-        toolbox
-            .call("git_checkout", json!({ "target": "new-feature" }))
-            .await?;
-
-        let result = toolbox.call("git_branch", json!({})).await?;
-        let content = result["content"].as_str().unwrap();
-        assert!(content.contains("* new-feature"));
-
-        // Create tag
-        Command::new("git")
-            .current_dir(&repo_path)
-            .args(["tag", "v1.0"])
-            .output()
-            .await?;
-
-        // Test git_tag
-        let result = toolbox.call("git_tag", json!({})).await?;
-        let content = result["content"].as_str().unwrap();
-        assert!(content.contains("v1.0"));
+        // Test git_log
+        let result = toolbox.call("git_log", json!({ "range": "HEAD" })).await?;
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("Initial"));
 
         Ok(())
     }
@@ -1009,45 +940,43 @@ mod tests {
 
         // 1. Test git_diff with safe args
         let args = json!({
-            "args": ["HEAD^", "HEAD", "--stat"]
+            "base_revision": "HEAD^",
+            "target_revision": "HEAD"
         });
         let res = toolbox.call("git_diff", args).await;
         if let Err(e) = res {
-            assert!(!e.to_string().contains("Forbidden git option"));
+            assert!(!e.to_string().contains("Invalid revision names"));
         }
 
         // Test git_diff with forbidden args
         let args = json!({
-            "args": ["HEAD^", "HEAD", "--output=malicious.txt"]
+            "base_revision": "--output=malicious.txt",
+            "target_revision": "HEAD"
         });
         let res = toolbox.call("git_diff", args).await;
         assert!(res.is_err());
         assert!(
             res.unwrap_err()
                 .to_string()
-                .contains("Forbidden git option: --output=malicious.txt")
+                .contains("Invalid revision names")
         );
 
         // 2. Test git_log with safe args
         let args = json!({
-            "args": ["--oneline", "--since=1.year.ago"]
+            "range": "HEAD"
         });
         let res = toolbox.call("git_log", args).await;
         if let Err(e) = res {
-            assert!(!e.to_string().contains("Forbidden git option"));
+            assert!(!e.to_string().contains("Invalid range"));
         }
 
         // Test git_log with forbidden args
         let args = json!({
-            "args": ["--output=malicious.txt"]
+            "range": "--output=malicious.txt"
         });
         let res = toolbox.call("git_log", args).await;
         assert!(res.is_err());
-        assert!(
-            res.unwrap_err()
-                .to_string()
-                .contains("Forbidden git option: --output=malicious.txt")
-        );
+        assert!(res.unwrap_err().to_string().contains("Invalid range"));
 
         // 3. Test git_show with safe object
         let args = json!({

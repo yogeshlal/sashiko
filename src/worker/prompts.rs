@@ -492,6 +492,30 @@ impl Worker {
             .unwrap_or_else(|| "multi".to_string());
         self.context_tag = Some(format!("[ps:{} p:{}] ", ps_id, p_id));
 
+        let mut baseline_sha = "unknown".to_string();
+        if let Some(ref range) = self.series_range {
+            let parts: Vec<&str> = range.split("..").collect();
+            if !parts.is_empty() {
+                baseline_sha = parts[0].to_string();
+            }
+        }
+
+        let mut target_commit_sha = "unknown".to_string();
+        if let Some(patches) = patchset["patches"].as_array() {
+            if let Some(idx) = patchset["patch_index"].as_i64()
+                && let Some(p) = patches.iter().find(|p| p["index"].as_i64() == Some(idx))
+                && let Some(sha) = p["commit_id"].as_str()
+            {
+                target_commit_sha = sha.to_string();
+            }
+            if target_commit_sha == "unknown"
+                && !patches.is_empty()
+                && let Some(sha) = patches[0]["commit_id"].as_str()
+            {
+                target_commit_sha = sha.to_string();
+            }
+        }
+
         if let Some(patches) = patchset["patches"].as_array() {
             for p in patches {
                 if let Some(show) = p["git_show"].as_str() {
@@ -599,12 +623,23 @@ impl Worker {
             .build_context(selected_prompts.as_deref())
             .await?;
 
+        let mut git_metadata = String::new();
+        git_metadata.push_str("\n\n=== Active Git Metadata ===\n");
+        git_metadata.push_str(&format!("Target Commit SHA: {}\n", target_commit_sha));
+        git_metadata.push_str(&format!("Baseline SHA: {}\n", baseline_sha));
+        if let Some(ref range) = self.series_range {
+            git_metadata.push_str(&format!("Series Range: {}\n", range));
+        }
+        git_metadata.push_str("===========================\n");
+
         let mut dynamic_context = String::new();
+        dynamic_context.push_str(&git_metadata);
         dynamic_context.push_str("\n\nTarget Commit:\n");
         dynamic_context.push_str(&target_commit_diff);
         let mut clean_dynamic_context = dynamic_context.clone();
 
         let mut dynamic_context_no_log = String::new();
+        dynamic_context_no_log.push_str(&git_metadata);
         dynamic_context_no_log.push_str("\n\nTarget Commit Diff:\n");
         dynamic_context_no_log.push_str(&target_commit_diff_only);
         let mut clean_dynamic_context_no_log = dynamic_context_no_log.clone();

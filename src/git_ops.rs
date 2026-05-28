@@ -175,31 +175,6 @@ impl GitWorktree {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn apply_raw_diff(&self, diff_content: &str) -> Result<std::process::Output> {
-        info!("Applying raw diff in {:?}", self.path);
-
-        let mut child = Command::new("git")
-            .current_dir(&self.path)
-            .args(["-c", "safe.bareRepository=all"])
-            .arg("apply")
-            .arg("-") // Read from stdin
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(diff_content.as_bytes()).await?;
-        }
-
-        let output = child.wait_with_output().await?;
-
-        Ok(output)
-    }
-
     pub async fn get_commit_show(&self, hash: &str) -> Result<String> {
         let output = Command::new("git")
             .current_dir(&self.path)
@@ -766,57 +741,6 @@ pub async fn git_status(repo_path: &Path) -> Result<String> {
     }
 }
 
-pub async fn git_checkout(repo_path: &Path, target: &str) -> Result<()> {
-    let output = Command::new("git")
-        .current_dir(repo_path)
-        .args(["checkout", target])
-        .output()
-        .await?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "git checkout failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-pub async fn git_branch(repo_path: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .current_dir(repo_path)
-        .args(["branch", "--list", "--all"])
-        .output()
-        .await?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(anyhow!(
-            "git branch failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
-pub async fn git_tag(repo_path: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .current_dir(repo_path)
-        .args(["tag", "--list"])
-        .output()
-        .await?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        Err(anyhow!(
-            "git tag failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
 /// Metadata extracted from a single git commit.
 pub struct PatchMetadata {
     pub author: String,
@@ -989,34 +913,6 @@ mod tests {
         // Test git_status
         let status = git_status(&repo_path).await?;
         assert!(status.contains("nothing to commit, working tree clean"));
-
-        // Create a branch
-        Command::new("git")
-            .current_dir(&repo_path)
-            .args(["branch", "feature"])
-            .output()
-            .await?;
-
-        // Test git_branch
-        let branches = git_branch(&repo_path).await?;
-        assert!(branches.contains("feature"));
-        assert!(branches.contains("master"));
-
-        // Test git_checkout
-        git_checkout(&repo_path, "feature").await?;
-        let branches_after = git_branch(&repo_path).await?;
-        assert!(branches_after.contains("* feature"));
-
-        // Create a tag
-        Command::new("git")
-            .current_dir(&repo_path)
-            .args(["tag", "v1.0"])
-            .output()
-            .await?;
-
-        // Test git_tag
-        let tags = git_tag(&repo_path).await?;
-        assert!(tags.contains("v1.0"));
 
         Ok(())
     }

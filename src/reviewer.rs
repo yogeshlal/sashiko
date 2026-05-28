@@ -888,27 +888,6 @@ impl Reviewer {
                     // Try git am
                     if (worktree.apply_patch(&mbox).await).is_ok() {
                         applied = true;
-                    } else {
-                        // Fallback raw diff
-                        if let Ok(output) = worktree.apply_raw_diff(diff).await
-                            && output.status.success()
-                        {
-                            applied = true;
-                            // Commit raw diff
-                            let _ = Command::new("git")
-                                .current_dir(&worktree.path)
-                                .args(["add", "."])
-                                .output()
-                                .await;
-                            let commit_msg = format!("{}\n\n(Applied via git apply)", subject);
-                            let _ = Command::new("git")
-                                .current_dir(&worktree.path)
-                                .env("GIT_AUTHOR_NAME", author)
-                                .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
-                                .args(["commit", "-m", &commit_msg])
-                                .output()
-                                .await;
-                        }
                     }
                 }
 
