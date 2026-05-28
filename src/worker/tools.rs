@@ -160,7 +160,7 @@ impl ToolBox {
                     "properties": {
                         "revision": { "type": "string", "description": "The Git commit SHA or reference to search at." },
                         "pattern": { "type": "string", "description": "Regex pattern to search for (or literal search string if is_literal is true)." },
-                        "path": { "type": "string", "description": "Space-separated list of relative path prefixes or patterns to restrict the search (optional). Supports Git pathspec syntax, e.g. 'fs/' to include, ':!drivers/' to exclude." },
+                        "path": { "type": "string", "description": "Space-separated list of relative path prefixes or patterns to restrict the search (optional). HIGHLY RECOMMENDED: Always restrict your search to the directories of the files modified by the patch (e.g., 'net/mptcp/' or 'drivers/gpu/drm/') unless you are explicitly looking for a global kernel symbol definition. Tree-wide searches without path constraints are extremely slow, prone to truncation, and waste token budget." },
                         "context_lines": { "type": "integer", "description": "Number of context lines to show (default 0)." },
                         "count_only": { "type": "boolean", "description": "If true, returns only the list of files and the count of matches in each file, without the actual line content. Highly recommended for cheap broad searches." },
                         "is_literal": { "type": "boolean", "description": "If true, treats pattern as a literal C/C++ string rather than a PCRE regex. Highly recommended when searching for literal code containing unescaped parentheses like 'exit_mm('." }
