@@ -307,7 +307,8 @@ Your task is to identify whether any remaining concern conflicts with a dismisse
 3. If the concern is correct, keep it in the output. If the dismissed_concern is correct, discard that concern.
 4. If there is no direct conflict for a concern, keep it unchanged.
 5. Do not discard a concern merely because a dismissed_concern is vaguely related; only discard when the dismissed_concern's evidence concretely disproves that concern.
-6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, and `locations` fields."
+6. Preserve each retained concern's `type`, `description`, `reasoning`, `preexisting`, and `locations` fields.
+7. LOCAL BOUNDARY RULE: Do not discard a defect within the modified code of the patch by assuming that surrounding caller systems, parallel execution, or legacy API layers will safely mask or prevent the issue, unless you can point to specific code that concretely proves the failure mode is structurally impossible. If you cannot prove the safety of the violation based on the specific code, you must keep the concern."
             }
             10 => {
                 "# Stage 10. Verification and severity estimation
