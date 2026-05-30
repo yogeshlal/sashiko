@@ -285,13 +285,6 @@ impl GitWorktree {
         }
         info!("Removing worktree at {:?}", self.path);
 
-        // Split worktree removal into two phases:
-        // 1) directory cleanup (no lock, parallelizable)
-        // 2) metadata removal (under lock, fast)
-        if self.path.exists() {
-            std::fs::remove_dir_all(&self.path)?;
-        }
-
         let output = {
             let lock = get_worktree_lock();
             let _guard = lock.lock().await;
