@@ -3430,7 +3430,26 @@ impl Database {
                 .await?;
         }
 
-        // 4. Delete failed reviews that block retrying (infra failures)
+        // 4. Delete associated tool usages and findings for failed reviews that block retrying
+        self.conn
+            .execute(
+                "DELETE FROM tool_usages WHERE review_id IN (
+                    SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
+                )",
+                libsql::params![id],
+            )
+            .await?;
+
+        self.conn
+            .execute(
+                "DELETE FROM findings WHERE review_id IN (
+                    SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
+                )",
+                libsql::params![id],
+            )
+            .await?;
+
+        // 5. Delete failed reviews that block retrying (infra failures)
         self.conn
             .execute(
                 "DELETE FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
