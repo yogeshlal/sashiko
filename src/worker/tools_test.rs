@@ -47,10 +47,15 @@ mod tests {
             toolbox.virtualize_ref("baseline..HEAD"),
             "baseline..abc123e"
         );
+        assert_eq!(
+            toolbox.virtualize_ref("HEAD..baseline"),
+            "abc123e..baseline"
+        );
         assert_eq!(toolbox.virtualize_ref("HEAD:file.c"), "abc123e:file.c");
 
         // Non-replacements
         assert_eq!(toolbox.virtualize_ref("origin/HEAD"), "origin/HEAD");
+        assert_eq!(toolbox.virtualize_ref("origin/HEAD~1"), "origin/HEAD~1");
         assert_eq!(
             toolbox.virtualize_ref("refs/remotes/origin/HEAD"),
             "refs/remotes/origin/HEAD"
