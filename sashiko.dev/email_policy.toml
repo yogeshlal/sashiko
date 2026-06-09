@@ -215,3 +215,7 @@ lists = ["linux-scsi@vger.kernel.org"]
 reply_to_author = true
 cc = ["linux-scsi@vger.kernel.org"]
 
+[subsystems.linux-target]
+lists = ["linux-target@vger.kernel.org"]
+reply_to_author = true
+cc = ["linux-target@vger.kernel.org"]
